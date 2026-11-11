@@ -12,13 +12,43 @@ concurrency:
 jobs:
   build-android:
     name: Build for Android (arm64-v8a)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
       ANDROID_API: "24"
+      # vcpkg commit matching vcpkg-configuration.json; used even if that file is missing from the repo
+      VCPKG_COMMIT: e8709ee8703328fe121eab33cda73a406a7626b7
+      VCPKG_BINARY_SOURCES: clear;files,${{ github.workspace }}/vcpkg-cache,readwrite
     steps:
     - uses: actions/checkout@v6
       with:
         fetch-depth: 0
+
+    - name: Locate project folder
+      run: |
+        # Works whether the source sits at the repository root or inside one subfolder.
+        PROJECT_DIR=""
+        for f in $(find . -maxdepth 3 -name CMakeLists.txt -not -path '*/.git/*' | sort); do
+          d=$(dirname "$f")
+          if [ -d "$d/android/app" ] && [ -d "$d/src" ]; then PROJECT_DIR="$d"; break; fi
+        done
+        if [ -z "$PROJECT_DIR" ]; then
+          echo "::error::Could not find the game source (CMakeLists.txt + android/ + src/). Upload the full contents of the ZIP."
+          exit 1
+        fi
+        PROJECT_DIR=$(cd "$PROJECT_DIR" && pwd)
+        echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+        echo "Project folder: $PROJECT_DIR"
+        cd "$PROJECT_DIR"
+        # Recreate vcpkg files if they were lost during upload
+        if [ ! -f vcpkg.json ]; then
+          echo "::warning::vcpkg.json was missing, recreating it"
+          printf '%s\n' '{' '  "dependencies": [' '    "libjpeg-turbo",' '    "libopenmpt",' '    "libpng",' '    { "name": "sdl2", "platform": "!android" },' '    "zlib"' '  ]' '}' > vcpkg.json
+        fi
+        if [ ! -f vcpkg-configuration.json ]; then
+          echo "::warning::vcpkg-configuration.json was missing, recreating it"
+          printf '%s\n' '{' '  "default-registry": {' '    "kind": "git",' "    \"baseline\": \"$VCPKG_COMMIT\"," '    "repository": "https://github.com/microsoft/vcpkg"' '  }' '}' > vcpkg-configuration.json
+        fi
+        mkdir -p "$GITHUB_WORKSPACE/vcpkg-cache"
 
     - name: Set up JDK
       uses: actions/setup-java@v5
@@ -48,6 +78,7 @@ jobs:
 
     - name: Download SDL2 Source
       run: |
+        cd "$PROJECT_DIR"
         SDL2_TAG=$(git ls-remote --tags https://github.com/libsdl-org/SDL.git 'refs/tags/release-2.*' \
           | sed 's|.*refs/tags/release-||' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)
         if [ -z "$SDL2_TAG" ]; then
@@ -68,18 +99,26 @@ jobs:
       uses: actions/cache@v6
       with:
         path: vcpkg-cache
-        key: vcpkg-android-${{ env.VCPKG_TC }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+        key: vcpkg-android-${{ env.VCPKG_TC }}-${{ env.VCPKG_COMMIT }}-${{ hashFiles('**/vcpkg.json') }}
         restore-keys: |
+          vcpkg-android-${{ env.VCPKG_TC }}-${{ env.VCPKG_COMMIT }}-
           vcpkg-android-${{ env.VCPKG_TC }}-
-          vcpkg-android-
 
     - name: Setup vcpkg
-      uses: lukka/run-vcpkg@v11
-      with:
-        vcpkgJsonGlob: vcpkg.json
+      run: |
+        # Fetch vcpkg at a fixed commit ourselves, so the build does not depend on
+        # an external action guessing the version.
+        VCPKG_ROOT="$RUNNER_TEMP/vcpkg"
+        git init -q "$VCPKG_ROOT"
+        git -C "$VCPKG_ROOT" remote add origin https://github.com/microsoft/vcpkg.git
+        git -C "$VCPKG_ROOT" fetch -q --depth 1 origin "$VCPKG_COMMIT"
+        git -C "$VCPKG_ROOT" checkout -q FETCH_HEAD
+        "$VCPKG_ROOT/bootstrap-vcpkg.sh" -disableMetrics
+        echo "VCPKG_ROOT=$VCPKG_ROOT" >> "$GITHUB_ENV"
 
     - name: Build SDL2 Shared Library
       run: |
+        cd "$PROJECT_DIR"
         # On Android, SDL2 MUST be a shared library because the Java-side
         # SDLActivity loads it via System.loadLibrary("SDL2").
         cmake -B build-sdl2 \
@@ -96,11 +135,12 @@ jobs:
 
     - name: Build Native Library with CMake
       run: |
+        cd "$PROJECT_DIR"
         ABI=arm64-v8a
         BUILD_DIR=build-android-$ABI
         SDL2_PREFIX=$GITHUB_WORKSPACE/sdl2-android
 
-        cmake -B $BUILD_DIR \
+        cmake -S . -B $BUILD_DIR \
           -DCMAKE_TOOLCHAIN_FILE=$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake \
           -DVCPKG_TARGET_TRIPLET=arm64-android \
           -DVCPKG_CMAKE_SYSTEM_VERSION=$ANDROID_API \
@@ -160,7 +200,7 @@ jobs:
         PVZP_KEY_ALIAS: ${{ secrets.PVZP_KEY_ALIAS }}
         PVZP_KEY_PASSWORD: ${{ secrets.PVZP_KEY_PASSWORD }}
       run: |
-        cd android
+        cd "$PROJECT_DIR/android"
         echo "sdk.dir=$ANDROID_HOME" > local.properties
 
         # Use gradle wrapper; package pre-built native libraries into a release APK
@@ -169,11 +209,15 @@ jobs:
 
     - name: Copy APK
       run: |
-        mkdir -p dist
-        find android -name "*.apk" -path "*/release/*" -exec cp {} dist/pvz-living-nightmare-android-arm64-v8a.apk \;
+        mkdir -p "$GITHUB_WORKSPACE/dist"
+        APK=$(find "$PROJECT_DIR/android" -name "*.apk" -path "*/release/*" | head -1)
+        if [ -z "$APK" ]; then echo "::error::No APK was produced"; exit 1; fi
+        cp "$APK" "$GITHUB_WORKSPACE/dist/pvz-living-nightmare-android-arm64-v8a.apk"
+        ls -lh "$GITHUB_WORKSPACE/dist"
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v7
       with:
         name: pvz-living-nightmare-android
         path: dist/
+        if-no-files-found: error
