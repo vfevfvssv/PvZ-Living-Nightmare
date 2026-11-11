@@ -26,13 +26,27 @@ jobs:
     - name: Locate project folder
       run: |
         # Works whether the source sits at the repository root or inside one subfolder.
-        PROJECT_DIR=""
-        for f in $(find . -maxdepth 3 -name CMakeLists.txt -not -path '*/.git/*' | sort); do
-          d=$(dirname "$f")
-          if [ -d "$d/android/app" ] && [ -d "$d/src" ]; then PROJECT_DIR="$d"; break; fi
-        done
+        find_project() {
+          PROJECT_DIR=""
+          for f in $(find . -maxdepth 4 -name CMakeLists.txt -not -path '*/.git/*' | sort); do
+            d=$(dirname "$f")
+            if [ -d "$d/android/app" ] && [ -d "$d/src" ]; then PROJECT_DIR="$d"; return 0; fi
+          done
+          return 0
+        }
+        find_project
+        # If only the source ZIP was uploaded, unpack it here.
         if [ -z "$PROJECT_DIR" ]; then
-          echo "::error::Could not find the game source (CMakeLists.txt + android/ + src/). Upload the full contents of the ZIP."
+          ZIP=$(find . -maxdepth 2 -iname '*.zip' -not -path '*/.git/*' | sort | head -1)
+          if [ -n "$ZIP" ]; then
+            echo "Source not unpacked in the repository; extracting $ZIP"
+            rm -rf ln-src && mkdir ln-src
+            unzip -q "$ZIP" -d ln-src
+            find_project
+          fi
+        fi
+        if [ -z "$PROJECT_DIR" ]; then
+          echo "::error::Could not find the game source (CMakeLists.txt + android/ + src/) nor a source ZIP in the repository."
           exit 1
         fi
         PROJECT_DIR=$(cd "$PROJECT_DIR" && pwd)
